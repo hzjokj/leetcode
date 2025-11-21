@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
             echo "用法: $0 [选项] [提交信息]"
             echo ""
             echo "选项:"
-            echo "  -a, --all      提交所有更改(默认行为)"
+            echo "  -a, --all      提交所有更改(包括新文件)"
             echo "  -s, --staged   只提交已暂存的文件"
             echo "  -h, --help     显示此帮助信息"
             echo ""
@@ -47,8 +47,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 1. 检查是否有更改
-if git diff --cached --quiet && git diff --quiet; then
+# 1. 检查是否有更改(包括新文件)
+# 使用 git status --porcelain 可以检测到所有类型的改动
+HAS_STAGED=$(git diff --cached --quiet && echo "false" || echo "true")
+HAS_UNSTAGED=$(git status --porcelain | grep -q '^ M\|^M \|^MM\|^ D\|^??' && echo "true" || echo "false")
+
+if [ "$HAS_STAGED" = "false" ] && [ "$HAS_UNSTAGED" = "false" ]; then
     echo -e "${GREEN}============================================${NC}"
     echo -e "${GREEN}✅ 工作区和暂存区都很干净,无需提交。${NC}"
     echo -e "${GREEN}============================================${NC}"
@@ -74,10 +78,10 @@ case $MODE in
         echo -e "${BLUE}🚀 模式: 选择性提交${NC}"
         echo ""
 
-        # 获取所有更改的文件
-        mapfile -t MODIFIED_FILES < <(git status --porcelain | awk '{print $2}')
+        # 获取所有更改的文件(包括未跟踪的新文件)
+        mapfile -t ALL_FILES < <(git status --porcelain | sed 's/^...//; s/^"//; s/"$//')
 
-        if [ ${#MODIFIED_FILES[@]} -eq 0 ]; then
+        if [ ${#ALL_FILES[@]} -eq 0 ]; then
             echo -e "${GREEN}✅ 没有修改的文件。${NC}"
             exit 0
         fi
@@ -86,15 +90,25 @@ case $MODE in
         echo -e "${YELLOW}发现以下修改的文件:${NC}"
         echo ""
 
-        for i in "${!MODIFIED_FILES[@]}"; do
-            FILE="${MODIFIED_FILES[$i]}"
-            STATUS=$(git status --porcelain "$FILE" | awk '{print $1}')
+        DISPLAY_FILES=()
+        for i in "${!ALL_FILES[@]}"; do
+            FILE="${ALL_FILES[$i]}"
+            # 跳过空行
+            [ -z "$FILE" ] && continue
+
+            DISPLAY_FILES+=("$FILE")
+        done
+
+        for i in "${!DISPLAY_FILES[@]}"; do
+            FILE="${DISPLAY_FILES[$i]}"
+            STATUS=$(git status --porcelain | grep -F "$FILE" | awk '{print $1}')
 
             case $STATUS in
-                M) STATUS_TEXT="${YELLOW}[已修改]${NC}" ;;
-                A) STATUS_TEXT="${GREEN}[新增]${NC}" ;;
+                M|MM|AM) STATUS_TEXT="${YELLOW}[已修改]${NC}" ;;
+                A) STATUS_TEXT="${GREEN}[新增已暂存]${NC}" ;;
                 D) STATUS_TEXT="${RED}[已删除]${NC}" ;;
-                ??) STATUS_TEXT="${BLUE}[未跟踪]${NC}" ;;
+                ??) STATUS_TEXT="${BLUE}[新建未跟踪]${NC}" ;;
+                R) STATUS_TEXT="${GREEN}[重命名]${NC}" ;;
                 *) STATUS_TEXT="[${STATUS}]" ;;
             esac
 
@@ -151,8 +165,8 @@ case $MODE in
             ADDED_COUNT=0
             for IDX in "${SELECTED_INDICES[@]}"; do
                 ARRAY_IDX=$((IDX-1))
-                if [ $ARRAY_IDX -ge 0 ] && [ $ARRAY_IDX -lt ${#MODIFIED_FILES[@]} ]; then
-                    FILE="${MODIFIED_FILES[$ARRAY_IDX]}"
+                if [ $ARRAY_IDX -ge 0 ] && [ $ARRAY_IDX -lt ${#DISPLAY_FILES[@]} ]; then
+                    FILE="${DISPLAY_FILES[$ARRAY_IDX]}"
                     git add "$FILE"
                     echo -e "${GREEN}  ✓${NC} 已添加: $FILE"
                     ((ADDED_COUNT++))
@@ -184,21 +198,106 @@ git diff --cached --name-status | while read STATUS FILE; do
         M) echo -e "  ${YELLOW}修改:${NC} $FILE" ;;
         A) echo -e "  ${GREEN}新增:${NC} $FILE" ;;
         D) echo -e "  ${RED}删除:${NC} $FILE" ;;
+        R*) echo -e "  ${GREEN}重命名:${NC} $FILE" ;;
         *) echo -e "  [$STATUS] $FILE" ;;
     esac
 done
 
-# 5. 确定提交信息
+# 5. 确定提交信息(使用编辑器)
 echo ""
 if [ -z "$COMMIT_MSG" ]; then
+    echo -e "${BLUE}========================================${NC}"
     echo -e "${BLUE}请输入提交信息 (Commit Message):${NC}"
-    read -r USER_INPUT_MSG
+    echo -e "${YELLOW}提示:${NC}"
+    echo "  - 将打开文本编辑器进行编辑"
+    echo "  - 支持完整的编辑功能(方向键、删除、复制粘贴等)"
+    echo "  - 编辑完成后保存并关闭编辑器"
+    echo "  - 空文件将使用默认提交信息"
+    echo -e "${BLUE}========================================${NC}"
 
-    if [ -z "$USER_INPUT_MSG" ]; then
-        COMMIT_MSG="Auto commit on $(date +'%Y-%m-%d %H:%M:%S')"
-        echo -e "${YELLOW}⚠️  使用默认提交信息: $COMMIT_MSG${NC}"
+    # 创建临时文件
+    TEMP_COMMIT_FILE=$(mktemp /tmp/git-commit-msg.XXXXXX)
+
+    # 添加提示信息到临时文件
+    cat > "$TEMP_COMMIT_FILE" << 'EOF'
+# 请在上方输入提交信息
+#
+# 提示:
+#   - 第一行是简短的提交摘要(建议不超过50字符)
+#   - 空一行后可以写详细描述
+#   - 以 '#' 开头的行将被忽略
+#
+# 示例:
+# feat: 添加用户登录功能
+#
+# - 实现JWT认证
+# - 添加密码加密
+# - 增加登录日志
+EOF
+
+    # 确定使用的编辑器
+    if [ -n "$VISUAL" ]; then
+        EDITOR_CMD="$VISUAL"
+    elif [ -n "$EDITOR" ]; then
+        EDITOR_CMD="$EDITOR"
+    elif command -v nano &> /dev/null; then
+        EDITOR_CMD="nano"
+    elif command -v vim &> /dev/null; then
+        EDITOR_CMD="vim"
+    elif command -v vi &> /dev/null; then
+        EDITOR_CMD="vi"
     else
-        COMMIT_MSG="$USER_INPUT_MSG"
+        EDITOR_CMD="cat"
+        echo -e "${YELLOW}⚠️  未找到文本编辑器,将使用简单输入模式${NC}"
+    fi
+
+    # 打开编辑器
+    echo -e "${GREEN}正在打开编辑器: $EDITOR_CMD${NC}"
+    echo ""
+
+    if [ "$EDITOR_CMD" = "cat" ]; then
+        # 降级方案:使用简单的多行输入
+        echo "请输入提交信息 (输入 :wq 或 :q! 结束):"
+        COMMIT_LINES=()
+        while IFS= read -r line; do
+            if [[ "$line" == ":wq" ]] || [[ "$line" == ":q!" ]]; then
+                break
+            fi
+            COMMIT_LINES+=("$line")
+        done
+        printf "%s\n" "${COMMIT_LINES[@]}" > "$TEMP_COMMIT_FILE"
+    else
+        $EDITOR_CMD "$TEMP_COMMIT_FILE"
+        EDIT_EXIT_CODE=$?
+
+        # 检查编辑器是否正常退出
+        if [ $EDIT_EXIT_CODE -ne 0 ]; then
+            echo -e "${RED}❌ 编辑器异常退出,操作已取消${NC}"
+            rm -f "$TEMP_COMMIT_FILE"
+            exit 1
+        fi
+    fi
+
+    # 读取并处理提交信息
+    # 移除注释行和空行
+    COMMIT_MSG=$(grep -v '^#' "$TEMP_COMMIT_FILE" | sed '/^$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    # 清理临时文件
+    rm -f "$TEMP_COMMIT_FILE"
+
+    # 检查是否有有效内容
+    if [ -z "$COMMIT_MSG" ]; then
+        COMMIT_MSG="Auto commit on $(date +'%Y-%m-%d %H:%M:%S')"
+        echo ""
+        echo -e "${YELLOW}⚠️  未输入提交信息,使用默认提交信息:${NC}"
+        echo -e "${YELLOW}   $COMMIT_MSG${NC}"
+    else
+        # 计算行数
+        LINE_COUNT=$(echo "$COMMIT_MSG" | wc -l)
+        echo ""
+        echo -e "${GREEN}✅ 已接收提交信息 (共 $LINE_COUNT 行)${NC}"
+        echo -e "${BLUE}预览:${NC}"
+        echo "$COMMIT_MSG" | sed 's/^/  /'
     fi
 fi
 
@@ -220,6 +319,6 @@ if git push; then
     echo -e "${GREEN}🎉 推送成功! 代码已更新到远程仓库。${NC}"
     echo -e "${GREEN}============================================${NC}"
 else
-    echo -e "${RED}❌ 推送失败,请检查远程分支和网络连接。${NC}"
+    echo -e "${RED}❌推送失败,请检查远程分支和网络连接。${NC}"
     exit 1
 fi
